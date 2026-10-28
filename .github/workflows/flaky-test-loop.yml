@@ -1,0 +1,307 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Temporary workflow (do not merge): runs tests, or the complete Flink CI, many times on a
+# commit without a fix ("before") and on a commit with the fix ("after"), to show whether a
+# flaky test is fixed. It needs the changes of ci-changes.patch (see README.md).
+#
+# How it runs on GitHub Actions (every job gets its own fresh machine):
+#
+# TEST set to some tests (test mode):
+#   1. Settings job (a few seconds).
+#   2. Per commit, up to SHARDS machines in parallel. BEFORE_COUNT / AFTER_COUNT runs are
+#      split evenly across them, e.g. BEFORE_COUNT 100 and SHARDS 5: 5 machines x 20 runs.
+#      Each machine builds MODULE and its dependencies once, then runs TEST again and again,
+#      one run after another.
+#   This mirrors the "Test" job of template.flink-ci.yml: same container, JDK setup, non-root
+#   user, Maven wrapper options (tools/ci/maven-utils.sh) and build/test options
+#   (tools/ci/test_controller.sh), but builds only MODULE and does not use the CI watchdog.
+#
+# TEST set to '' (full CI mode):
+#   1. Settings job (a few seconds).
+#   2. Per commit, 1 compile job.
+#   3. Per commit, BEFORE_COUNT / AFTER_COUNT copies of the complete Flink CI in parallel,
+#      10 jobs each (6 test modules, 4 E2E groups), all using the compile job of that commit.
+#   This is the "Default (Java 17)" job of ci.yml, except that the packaging/licensing job
+#   doesn't run (it runs no tests and no other job depends on it).
+#
+# ROUNDS repeats step 2 (test mode) or step 3 (full CI mode) in the same workflow run, e.g.
+# ROUNDS 3: round 1 (R1), round 2 (R2) and round 3 (R3) of each commit's jobs. GitHub runs at most one round's
+# worth of them at once (max-parallel) and starts the next ones as earlier ones finish, so the
+# rounds can overlap a little. Each full CI round has its own compile job.
+#
+# The Settings job stops the run if one round would need more than MAX_JOBS jobs at once.
+
+name: "Flaky test loop"
+
+on:
+  push:
+    branches:
+      # The branch that starts this workflow. If you change it, change the branches-ignore
+      # entry in ci.yml too, so that the push doesn't also start the normal CI.
+      - 'flaky-loop/**'
+
+permissions: read-all
+
+env:
+  # ---- Change these ----
+  # The code without the fix:
+  # - BEFORE_COMMIT: a commit ID or branch name. '' skips it.
+  # - BEFORE_REPO: the repository to take it from, e.g. 'apache/flink'. '' is the repository
+  #   this workflow runs in (your fork).
+  # - BEFORE_COUNT: test mode: the number of test runs. Full CI mode: the number of complete
+  #   CI runs. 0 skips it.
+  BEFORE_COMMIT: 'eead57e7a073c6d69e3fa48e0baebcd7f597fad5'
+  BEFORE_REPO: 'apache/flink'
+  BEFORE_COUNT: 1
+  # The code with the fix, the same way.
+  AFTER_COMMIT: ''
+  AFTER_REPO: ''
+  AFTER_COUNT: 0
+  # Keep exactly one TEST line uncommented.
+  # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test':
+  # TEST: 'MyTest#testA+testB'
+  # The complete Flink CI:
+  TEST: ''
+  # Test mode: the Maven module that contains the tests.
+  MODULE: 'flink-runtime'
+  # Test mode: the most machines per commit.
+  SHARDS: 5
+  # How many times to run everything in this one workflow run (1 or more). GitHub runs at
+  # most one round at once and starts the next round's jobs as earlier ones finish.
+  ROUNDS: 20
+  # true: the first failure cancels everything still running or queued (all rounds). In test
+  # mode, a machine also stops at its first failed run. false: everything runs to the end.
+  STOP_ON_FIRST_FAILURE: false
+  # Java version: 11, 17 or 21 (the versions Flink CI tests with).
+  JDK: 17
+  # Extra Maven options, e.g. '-Penable-adaptive-scheduler' to match that nightly build.
+  EXTRA_PROFILE: ''
+  # The number of jobs GitHub runs at once for your plan: Free 20, Pro 40, Team 60,
+  # Enterprise 500 (https://docs.github.com/en/actions/reference/limits). A repository under
+  # a paid account or organization can run more jobs at once.
+  MAX_JOBS: 20
+  # ---- Usually unchanged ----
+  # Limit for one test run: GHA_JOB_TIMEOUT of the CI test job in template.flink-ci.yml.
+  # The runs of one machine have to fit into the 360 minutes of a job.
+  RUN_TIMEOUT_MINUTES: 240
+  MOUNTED_WORKING_DIR: /__w/flink/flink
+  CONTAINER_LOCAL_WORKING_DIR: /root/flink
+  MAVEN_REPO_FOLDER: /root/.m2/repository
+  MAVEN_ARGS: -Dmaven.repo.local=/root/.m2/repository
+
+jobs:
+  settings:
+    name: "Settings"
+    runs-on: ubuntu-24.04
+    outputs:
+      mode: ${{ steps.read.outputs.mode }}
+      matrix: ${{ steps.read.outputs.matrix }}
+      profile: ${{ steps.read.outputs.profile }}
+      jdk: ${{ steps.read.outputs.jdk }}
+      max-parallel: ${{ steps.read.outputs.max-parallel }}
+      module: ${{ steps.read.outputs.module }}
+      stop-on-first-failure: ${{ steps.read.outputs.stop-on-first-failure }}
+    steps:
+      - id: read
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          for name in BEFORE_COUNT AFTER_COUNT SHARDS MAX_JOBS ROUNDS; do
+            [[ "${!name}" =~ ^[0-9]+$ ]] || fail "$name must be a number, got '${!name}'."
+          done
+          [ "$SHARDS" -ge 1 ] || fail "SHARDS must be at least 1."
+          [ "$ROUNDS" -ge 1 ] || fail "ROUNDS must be at least 1."
+          case "$JDK" in 11|17|21) ;; *) fail "JDK must be 11, 17 or 21, got '$JDK'." ;; esac
+          case "$STOP_ON_FIRST_FAILURE" in true|false) ;; *) fail "STOP_ON_FIRST_FAILURE must be true or false." ;; esac
+          [[ "$EXTRA_PROFILE" =~ ^[A-Za-z0-9\ ._=,:/+-]*$ ]] || fail "EXTRA_PROFILE may not contain quotes or other special characters."
+          if [ -z "$TEST" ]; then mode=ci; else mode=loop; fi
+
+          entries=""
+          # matrix entries per round: full CI mode one per commit, test mode one per machine
+          per_round=0
+          jobs=0
+          # adds the jobs of one commit: add <variant> <commit> <repo> <count>
+          add() {
+            local variant=$1 commit=$2 repo=${3:-$GITHUB_REPOSITORY} count=$4
+            if [ -z "$commit" ] || [ "$count" -eq 0 ]; then
+              echo "$variant: skipped"
+              return
+            fi
+            [[ "$commit" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "Not a commit ID or branch name: '$commit'."
+            [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "Not a repository like 'owner/name': '$repo'."
+            if [ "$mode" = ci ]; then
+              entries="$entries{\"variant\":\"$variant\",\"repo\":\"$repo\",\"ref\":\"$commit\",\"copies\":\"[$(seq -s, 1 "$count")]\"},"
+              per_round=$((per_round + 1))
+              jobs=$((jobs + count * 10))
+              echo "$variant: $count complete CI run(s) of $repo $commit"
+            else
+              local shards=$((count < SHARDS ? count : SHARDS)) s
+              for s in $(seq 1 "$shards"); do
+                # the first count % shards machines get one run more
+                entries="$entries{\"variant\":\"$variant\",\"repo\":\"$repo\",\"ref\":\"$commit\",\"shard\":$s,\"runs\":$((count / shards + (s <= count % shards ? 1 : 0)))},"
+              done
+              per_round=$((per_round + shards))
+              jobs=$((jobs + shards))
+              echo "$variant: $count run(s) of $TEST on $shards machine(s), $repo $commit"
+            fi
+          }
+          add before "$BEFORE_COMMIT" "$BEFORE_REPO" "$BEFORE_COUNT"
+          add after "$AFTER_COMMIT" "$AFTER_REPO" "$AFTER_COUNT"
+
+          [ -n "$entries" ] || fail "Set BEFORE_COMMIT or AFTER_COMMIT, with a count above 0."
+          # Full CI mode: once all compile jobs are done, count x 10 jobs run at once.
+          [ "$jobs" -le "$MAX_JOBS" ] || fail "This needs $jobs jobs at once, more than MAX_JOBS ($MAX_JOBS). Lower the counts or SHARDS, or run before and after in separate pushes."
+          echo "jobs at once: $jobs"
+          [ $((per_round * ROUNDS)) -le 256 ] || fail "$ROUNDS rounds need $((per_round * ROUNDS)) matrix entries, more than GitHub's maximum of 256. Lower ROUNDS or SHARDS."
+          echo "rounds: $ROUNDS, at most one round at once"
+          # the same entries once per round, round 1 first: {"round":1,...},...,{"round":2,...},...
+          rounds=""
+          for r in $(seq 1 "$ROUNDS"); do
+            rounds="$rounds${entries//\{/\{\"round\":$r,}"
+          done
+          {
+            echo "mode=$mode"
+            echo "matrix={\"include\":[${rounds%,}]}"
+            echo "max-parallel=$per_round"
+            echo "module=$MODULE"
+            echo "stop-on-first-failure=$STOP_ON_FIRST_FAILURE"
+            # same as the "Default (Java 17)" job in ci.yml, for the selected JDK
+            echo "profile=-Dinclude_hadoop_aws -Djdk$JDK -Pjava$JDK-target${EXTRA_PROFILE:+ $EXTRA_PROFILE}"
+            echo "jdk=$JDK"
+          } >> "$GITHUB_OUTPUT"
+
+  full-ci:
+    name: "R${{ matrix.round }}: ${{ matrix.variant }} CI"
+    needs: settings
+    if: needs.settings.outputs.mode == 'ci'
+    strategy:
+      fail-fast: ${{ needs.settings.outputs.stop-on-first-failure == 'true' }}
+      # one round at once
+      max-parallel: ${{ fromJSON(needs.settings.outputs.max-parallel) }}
+      matrix: ${{ fromJSON(needs.settings.outputs.matrix) }}
+    uses: ./.github/workflows/template.flink-ci.yml
+    with:
+      # different per round, because the compile job's artifact name contains it
+      workflow-caller-id: round${{ matrix.round }}-${{ matrix.variant }}
+      repository: ${{ matrix.repo }}
+      ref: ${{ matrix.ref }}
+      copies: ${{ matrix.copies }}
+      packaging: false
+      environment: PROFILE="${{ needs.settings.outputs.profile }}"
+      jdk_version: ${{ fromJSON(needs.settings.outputs.jdk) }}
+    secrets:
+      s3_bucket: ${{ secrets.IT_CASE_S3_BUCKET }}
+      s3_access_key: ${{ secrets.IT_CASE_S3_ACCESS_KEY }}
+      s3_secret_key: ${{ secrets.IT_CASE_S3_SECRET_KEY }}
+
+  loop:
+    # env can't be used in a job name, so MODULE comes from the Settings job
+    name: "R${{ matrix.round }}: ${{ matrix.variant }} shard ${{ matrix.shard }} · Build + Test (module: ${{ needs.settings.outputs.module }}) × ${{ matrix.runs }} ${{ matrix.runs == 1 && 'run' || 'runs' }}"
+    needs: settings
+    if: needs.settings.outputs.mode == 'loop'
+    runs-on: ubuntu-24.04
+    container:
+      # the image of the "Test" job in template.flink-ci.yml; change both together
+      image: apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble_v2
+      options: --init --privileged
+      volumes:
+        - /mnt:/root
+    # GitHub's maximum for a job, so that only RUN_TIMEOUT_MINUTES limits the single runs
+    timeout-minutes: 360
+    env:
+      # -Pgithub-actions as in the CI test step
+      PROFILE: ${{ needs.settings.outputs.profile }} -Pgithub-actions
+      RUNS: ${{ matrix.runs }}
+    strategy:
+      fail-fast: ${{ needs.settings.outputs.stop-on-first-failure == 'true' }}
+      # one round at once
+      max-parallel: ${{ fromJSON(needs.settings.outputs.max-parallel) }}
+      matrix: ${{ fromJSON(needs.settings.outputs.matrix) }}
+    steps:
+      - name: "Flink Checkout"
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.ref }}
+      - name: "Initialize job"
+        uses: "./.github/actions/job_init"
+        with:
+          jdk_version: ${{ env.JDK }}
+          maven_repo_folder: ${{ env.MAVEN_REPO_FOLDER }}
+          source_directory: ${{ env.MOUNTED_WORKING_DIR }}
+          target_directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+      - name: "Set coredump pattern"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: sudo sysctl -w kernel.core_pattern=core.%p
+      - name: "Create non-root user for test execution"
+        run: |
+          useradd -m -u 1001 flink
+          echo "flink ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          mkdir -p ${{ env.CONTAINER_LOCAL_WORKING_DIR }} ${{ env.MAVEN_REPO_FOLDER }}
+          chown -R flink:flink ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+          chown -R flink:flink ${{ env.MAVEN_REPO_FOLDER }}
+      - name: "Build ${{ env.MODULE }} and its dependencies"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: |
+          # compile options from tools/ci/test_controller.sh, limited to MODULE
+          runuser -u flink -- bash -c 'source ./tools/ci/maven-utils.sh && \
+            run_mvn -Dfast -Pskip-webui-build -DskipTests -T1C $PROFILE -pl "$MODULE" -am install'
+      - name: "Run the tests ${{ matrix.runs }} times"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: |
+          debug_dir="$PWD/debug_files"
+          reports="$MODULE/target/surefire-reports"
+          runuser -u flink -- mkdir -p "$debug_dir"
+          # common and test options from tools/ci/test_controller.sh
+          common="-Dfast -Pskip-webui-build -Dlog.dir=$debug_dir -Dlog4j.configurationFile=file://$PWD/tools/ci/log4j.properties"
+          test_opts="-Dflink.tests.with-openssl -Dflink.tests.check-segment-multiple-free -Darchunit.freeze.store.default.allowStoreUpdate=false -Dpekko.rpc.force-invocation-serialization"
+          # the selected tests, with the same surefire execution that runs unit tests in CI
+          goals="surefire:test@default-test -Dtest=$TEST"
+          failed=0
+          done_runs=0
+          for i in $(seq 1 "$RUNS"); do
+            rm -rf "$reports"
+            exit_code=0
+            timeout --kill-after=1m "${RUN_TIMEOUT_MINUTES}m" \
+              runuser -u flink -- env JAVA_TOOL_OPTIONS="-XX:+HeapDumpOnOutOfMemoryError" IS_CI=true \
+                bash -c "source ./tools/ci/maven-utils.sh && run_mvn $common $test_opts \$PROFILE -pl \$MODULE $goals" \
+              || exit_code=$?
+            case $exit_code in
+              0) result=passed ;;
+              124|137) result=TIMEOUT ;;
+              *) result=FAILED ;;
+            esac
+            summary=$(cat "$reports"/*.txt 2>/dev/null \
+              | awk -F'[:,]' '/Tests run/ {n++; r+=$2; f+=$4; e+=$6; s+=$8} END {if (n) printf "Tests run: %d, Failures: %d, Errors: %d, Skipped: %d", r, f, e, s; else print "no test report"}' || true)
+            echo "run $i: $result | $summary"
+            done_runs=$i
+            if [ "$result" != passed ]; then
+              failed=$((failed + 1))
+              cp -r "$reports" "$debug_dir/reports-run-$i" 2>/dev/null || true
+              if [ "$STOP_ON_FIRST_FAILURE" = true ]; then
+                echo "STOP_ON_FIRST_FAILURE is true: stopping after run $i"
+                break
+              fi
+            fi
+          done
+          echo "R${{ matrix.round }} ${{ matrix.variant }} shard ${{ matrix.shard }}: $failed of $done_runs runs failed ($RUNS planned)" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$failed" -eq 0 ]
+      - name: "Upload test reports and logs"
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: reports-R${{ matrix.round }}-${{ matrix.variant }}-${{ matrix.shard }}
+          path: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}/debug_files

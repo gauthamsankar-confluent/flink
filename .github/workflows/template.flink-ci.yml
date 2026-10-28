@@ -32,6 +32,22 @@ on:
         description: "The Java version to use."
         default: 17
         type: number
+      repository:
+        description: "The repository to check out ref from (empty: the repository the workflow runs in)."
+        default: ""
+        type: string
+      ref:
+        description: "The commit to check out (empty: the commit that triggered the workflow)."
+        default: ""
+        type: string
+      copies:
+        description: "JSON list of copy numbers. The test and E2E jobs run once per copy; all copies use the same compile job."
+        default: "[1]"
+        type: string
+      packaging:
+        description: "Whether to run the packaging/licensing job (no other job depends on it)."
+        default: true
+        type: boolean
     secrets:
       s3_bucket:
         required: false
@@ -85,6 +101,8 @@ jobs:
       - name: "Flink Checkout"
         uses: actions/checkout@v7
         with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: "Initialize job"
@@ -136,6 +154,7 @@ jobs:
   packaging:
     name: "Test packaging/licensing"
     needs: compile
+    if: inputs.packaging
     runs-on: ubuntu-24.04
     container:
       image: apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble
@@ -147,6 +166,8 @@ jobs:
       - name: "Flink Checkout"
         uses: actions/checkout@v7
         with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           sparse-checkout: |
             .github
@@ -187,7 +208,7 @@ jobs:
           key: ${{ steps.job-init.outputs.maven-cache-key }}
 
   test:
-    name: "Test (module: ${{ matrix.module }})"
+    name: "Test (module: ${{ matrix.module }})${{ inputs.copies != '[1]' && format(' copy {0}', matrix.copy) || '' }}"
     needs: compile
     runs-on: ubuntu-24.04
     container:
@@ -203,25 +224,17 @@ jobs:
       GHA_JOB_TIMEOUT: 240
     strategy:
       fail-fast: false
+      # a plain list instead of "include", because "include" entries can't be combined with "copy"
       matrix:
-        include:
-          - module: core
-            stringified-module-name: core
-          - module: python
-            stringified-module-name: python
-          - module: table
-            stringified-module-name: table
-          - module: connect
-            stringified-module-name: connect
-          - module: tests
-            stringified-module-name: tests
-          - module: misc
-            stringified-module-name: misc
+        module: [core, python, table, connect, tests, misc]
+        copy: ${{ fromJSON(inputs.copies) }}
 
     steps:
       - name: "Flink Checkout"
         uses: actions/checkout@v7
         with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           sparse-checkout: |
             .github
@@ -326,7 +339,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{ failure() && steps.test-run.outputs.debug-files-output-dir != '' }}
         with:
-          name: logs-test-${{ needs.compile.outputs.stringified-workflow-name }}-${{ github.run_number }}-${{ matrix.stringified-module-name }}-${{ steps.test-run.outputs.debug-files-name }}
+          name: logs-test-${{ needs.compile.outputs.stringified-workflow-name }}-${{ github.run_number }}-${{ matrix.module }}-copy${{ matrix.copy }}-${{ steps.test-run.outputs.debug-files-name }}
           path: ${{ steps.test-run.outputs.debug-files-output-dir }}
 
       - name: "Save Docker images to cache"
@@ -342,7 +355,7 @@ jobs:
           key: ${{ steps.job-init.outputs.maven-cache-key }}
 
   e2e:
-    name: "E2E (group ${{ matrix.group }})"
+    name: "E2E (group ${{ matrix.group }})${{ inputs.copies != '[1]' && format(' copy {0}', matrix.copy) || '' }}"
     needs: compile
     # the end to end tests are not executed in Flink's CI Docker container due to problems when running Docker-in-Docker
     runs-on: ubuntu-24.04
@@ -367,11 +380,14 @@ jobs:
       fail-fast: false
       matrix:
         group: [1, 2, 3, 4]
+        copy: ${{ fromJSON(inputs.copies) }}
 
     steps:
       - name: "Flink Checkout"
         uses: actions/checkout@v7
         with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           sparse-checkout: |
             .github
@@ -467,7 +483,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{ failure() && steps.test-run.outputs.debug-files-output-dir != '' }}
         with:
-          name: logs-e2e-${{ needs.compile.outputs.stringified-workflow-name }}-${{ github.run_number }}-${{ matrix.group }}-${{ steps.test-run.outputs.debug-files-name }}
+          name: logs-e2e-${{ needs.compile.outputs.stringified-workflow-name }}-${{ github.run_number }}-${{ matrix.group }}-copy${{ matrix.copy }}-${{ steps.test-run.outputs.debug-files-name }}
           path: ${{ steps.test-run.outputs.debug-files-output-dir }}
 
       - name: "Save Docker images to Cache"

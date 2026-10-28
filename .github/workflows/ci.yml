@@ -20,6 +20,8 @@ name: "Flink CI (beta)"
 
 on:
   push:
+    branches-ignore:
+      - 'flaky-loop/**'
     paths-ignore:
       - 'docs/**'
       - '.idea/**'
