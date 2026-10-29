@@ -81,7 +81,7 @@ env:
   SHARDS: 5
   # How many times to run everything in this one workflow run (1 or more). GitHub runs at
   # most one round at once and starts the next round's jobs as earlier ones finish.
-  ROUNDS: 20
+  ROUNDS: 100
   # true: the first failure cancels everything still running or queued (all rounds). In test
   # mode, a machine also stops at its first failed run. false: everything runs to the end.
   STOP_ON_FIRST_FAILURE: false
