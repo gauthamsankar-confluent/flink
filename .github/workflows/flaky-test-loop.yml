@@ -65,7 +65,7 @@ env:
   #   CI runs. 0 skips it.
   BEFORE_COMMIT: 'eead57e7a073c6d69e3fa48e0baebcd7f597fad5'
   BEFORE_REPO: 'apache/flink'
-  BEFORE_COUNT: 100
+  BEFORE_COUNT: 5
   # The code with the fix, the same way.
   AFTER_COMMIT: ''
   AFTER_REPO: ''
@@ -74,7 +74,7 @@ env:
   # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test':
   # TEST: 'MyTest#testA+testB'
   # The complete Flink CI:
-  TEST: 'TaskFailureITCase'
+  TEST: 'TaskFailureParallelStressTest'
   # Test mode: the Maven module that contains the tests.
   MODULE: 'flink-tests'
   # Test mode: the most machines per commit.
