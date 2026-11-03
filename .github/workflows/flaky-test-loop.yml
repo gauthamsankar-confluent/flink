@@ -65,7 +65,7 @@ env:
   #   CI runs. 0 skips it.
   BEFORE_COMMIT: 'eead57e7a073c6d69e3fa48e0baebcd7f597fad5'
   BEFORE_REPO: 'apache/flink'
-  BEFORE_COUNT: 1
+  BEFORE_COUNT: 100
   # The code with the fix, the same way.
   AFTER_COMMIT: ''
   AFTER_REPO: ''
@@ -74,21 +74,21 @@ env:
   # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test':
   # TEST: 'MyTest#testA+testB'
   # The complete Flink CI:
-  TEST: ''
+  TEST: 'TaskFailureITCase'
   # Test mode: the Maven module that contains the tests.
-  MODULE: 'flink-runtime'
+  MODULE: 'flink-tests'
   # Test mode: the most machines per commit.
   SHARDS: 5
   # How many times to run everything in this one workflow run (1 or more). GitHub runs at
   # most one round at once and starts the next round's jobs as earlier ones finish.
-  ROUNDS: 100
+  ROUNDS: 1
   # true: the first failure cancels everything still running or queued (all rounds). In test
   # mode, a machine also stops at its first failed run. false: everything runs to the end.
   STOP_ON_FIRST_FAILURE: false
   # Java version: 11, 17 or 21 (the versions Flink CI tests with).
   JDK: 17
   # Extra Maven options, e.g. '-Penable-adaptive-scheduler' to match that nightly build.
-  EXTRA_PROFILE: ''
+  EXTRA_PROFILE: '-Penable-adaptive-scheduler'
   # The number of jobs GitHub runs at once for your plan: Free 20, Pro 40, Team 60,
   # Enterprise 500 (https://docs.github.com/en/actions/reference/limits). A repository under
   # a paid account or organization can run more jobs at once.
